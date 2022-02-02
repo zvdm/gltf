@@ -8,16 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"unsafe"
-)
-
-const (
-	defaultMaxMemoryAllocation = math.MaxUint32 // 4GB
 )
 
 // Open will open a glTF or GLB file specified by name and return the Document.
@@ -27,7 +23,7 @@ func Open(name string) (*Document, error) {
 		return nil, err
 	}
 	defer f.Close()
-	dec := NewDecoder(f).WithFS(dirFS(filepath.Dir(name)))
+	dec := NewDecoderFS(f, os.DirFS(filepath.Dir(name)))
 	doc := new(Document)
 	if err = dec.Decode(doc); err != nil {
 		doc = nil
@@ -38,23 +34,23 @@ func Open(name string) (*Document, error) {
 // A Decoder reads and decodes glTF and GLB values from an input stream.
 // FS is called to read external resources.
 type Decoder struct {
-	FS                  FS
-	MaxMemoryAllocation uint64
-	r                   *bufio.Reader
+	Fsys fs.FS
+	r    *bufio.Reader
 }
 
 // NewDecoder returns a new decoder that reads from r.
 func NewDecoder(r io.Reader) *Decoder {
 	return &Decoder{
-		MaxMemoryAllocation: defaultMaxMemoryAllocation,
-		r:                   bufio.NewReader(r),
+		r: bufio.NewReader(r),
 	}
 }
 
-// WithFS sets the FS.
-func (d *Decoder) WithFS(h FS) *Decoder {
-	d.FS = h
-	return d
+// NewDecoder returns a new decoder that reads from r.
+func NewDecoderFS(r io.Reader, fsys fs.FS) *Decoder {
+	return &Decoder{
+		Fsys: fsys,
+		r:    bufio.NewReader(r),
+	}
 }
 
 // Decode reads the next JSON-encoded value from its
@@ -80,17 +76,6 @@ func (d *Decoder) Decode(doc *Document) error {
 	return nil
 }
 
-func (d *Decoder) validateDocumentQuotas(doc *Document) error {
-	var allocs uint64
-	for _, b := range doc.Buffers {
-		allocs += uint64(b.ByteLength)
-	}
-	if allocs > d.MaxMemoryAllocation {
-		return errors.New("gltf: Memory allocation count quota exceeded")
-	}
-	return nil
-}
-
 func (d *Decoder) decodeDocument(doc *Document) (bool, error) {
 	glbHeader, err := d.readGLBHeader()
 	if err != nil {
@@ -109,9 +94,6 @@ func (d *Decoder) decodeDocument(doc *Document) (bool, error) {
 	}
 
 	err = jd.Decode(doc)
-	if err == nil {
-		err = d.validateDocumentQuotas(doc)
-	}
 	return isBinary, err
 }
 
@@ -155,14 +137,12 @@ func (d *Decoder) decodeBuffer(buffer *Buffer) error {
 	var err error
 	if buffer.IsEmbeddedResource() {
 		buffer.Data, err = buffer.marshalData()
-	} else if d.FS == nil {
+	} else if d.Fsys == nil {
 		err = errors.New("gltf: external buffer requires Decoder.FS")
 	} else if err = validateBufferURI(buffer.URI); err == nil {
-		buffer.Data = make([]byte, buffer.ByteLength)
-		var f io.ReadCloser
-		if f, err = d.FS.Open(sanitizeURI(buffer.URI)); err == nil {
-			_, err = io.ReadFull(f, buffer.Data)
-			f.Close()
+		buffer.Data, err = fs.ReadFile(d.Fsys, sanitizeURI(buffer.URI))
+		if len(buffer.Data) > int(buffer.ByteLength) {
+			buffer.Data = buffer.Data[:buffer.ByteLength:buffer.ByteLength]
 		}
 	}
 	if err != nil {
